@@ -1,0 +1,179 @@
+name: Sync aarch64_cortex-a53 Repository
+
+on:
+  schedule:
+    # 每周三、周日北京时间凌晨3点各运行一次 (UTC 周二、周六 19:00)
+    - cron: '0 19 * * 2,6'
+  # 支持手动触发
+  workflow_dispatch:
+
+# 必须赋予 GITHUB_TOKEN 写入权限
+permissions:
+  contents: write
+
+# 强制将服务器内部时区设为北京时间
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Pre-check Packages change
+        id: check_source
+        run: |
+          TARGET_DIR="openwrt-aarch64-cortex-a53"
+          
+          if [ ! -f "$TARGET_DIR/Packages" ]; then
+            echo "Local Packages not found. Proceeding with full sync."
+            echo "changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          LOCAL_HASH=$(sha256sum "$TARGET_DIR/Packages" | awk '{print $1}')
+          
+          mkdir -p /tmp/check_sync
+          wget -q -e robots=off --tries=3 --timeout=15 \
+            -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -O /tmp/check_sync/Packages \
+            https://opkg.cooluc.com/openwrt-24.10/aarch64_cortex-a53/Packages
+            
+          REMOTE_HASH=$(sha256sum /tmp/check_sync/Packages | awk '{print $1}')
+          
+          if [ "$LOCAL_HASH" = "$REMOTE_HASH" ]; then
+            echo "✅ 上游无变化，跳过大文件下载"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 发现更新，准备下载大文件"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+          rm -rf /tmp/check_sync
+
+      - name: Download all packages and index files
+        id: download_stage
+        if: "steps.check_source.outputs.changed == 'true'"
+        run: |
+          rm -rf /tmp/temp_download
+          mkdir -p /tmp/temp_download
+          cd /tmp/temp_download
+          
+          # 带防卡死、自动重试的硬核下载参数
+          wget -r -np -nd -nv -e robots=off \
+            --tries=3 \
+            --timeout=20 \
+            --waitretry=5 \
+            -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -A "*.ipk","Packages*" \
+            https://opkg.cooluc.com/openwrt-24.10/aarch64_cortex-a53/
+          
+          WGET_STATUS=$?
+          rm -f index.html* robots.txt*
+          
+          # 防错校验机制
+          if [ $WGET_STATUS -ne 0 ]; then
+            echo "sync_err=🚨 错误：重试3次后网络依然中断 (wget code $WGET_STATUS)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          if [ ! -f "Packages" ]; then
+            echo "sync_err=🚨 错误：未能下载到核心索引文件 Packages" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          EXPECTED_COUNT=$(grep -c "^Package:" Packages)
+          ACTUAL_COUNT=$(ls -1 *.ipk 2>/dev/null | wc -l)
+          
+          if [ "$EXPECTED_COUNT" -ne "$ACTUAL_COUNT" ]; then
+            MISSING_IPKS=$(grep "^Filename:" Packages | awk '{print $2}' | while read pkg; do [ ! -f "$pkg" ] && echo "$pkg"; done | tr '\n' ' ' | sed 's/ $//')
+            echo "sync_err=🚨 错误：组件数量不匹配！缺失包：$MISSING_IPKS" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "sync_err=none" >> $GITHUB_OUTPUT
+
+      - name: Update Content & Write README
+        id: update_readme
+        run: |
+          TARGET_DIR="openwrt-aarch64-cortex-a53"
+          SHORT_DATE=$(date '+%-m月%-d日')
+          ERR_MSG="${{ steps.download_stage.outputs.sync_err }}"
+          
+          # 1. 下载或对账失败时的处理
+          if [ -n "$ERR_MSG" ] && [ "$ERR_MSG" != "none" ]; then
+            STATUS_MSG="$ERR_MSG"
+            COMMIT_MSG="$SHORT_DATE 同步失败提示"
+            echo "is_failed=true" >> $GITHUB_OUTPUT
+            
+          # 2. 正常发现更新并对账成功的逻辑
+          elif [ "${{ steps.check_source.outputs.changed }}" == 'true' ]; then
+            mkdir -p "$TARGET_DIR"
+            
+            # 终极无敌版防乱码、防截断的包名提取正则
+            UPDATED_PKGS=$(diff -qr "$TARGET_DIR" /tmp/temp_download | grep -iE "differ|only in" | grep -oE "[a-zA-Z0-9_-]+_[0-9a-zA-Z._~+-]+\.ipk" | sed -E 's/_(.*)\.ipk//' | sort -u | tr '\n' ' ' | sed 's/ $//')
+            if [ -z "$UPDATED_PKGS" ]; then UPDATED_PKGS="索引文件微调"; fi
+            
+            find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.github' ! -name "$TARGET_DIR" -exec rm -rf {} +
+            find "$TARGET_DIR" -mindepth 1 -delete
+            cp -r /tmp/temp_download/* "$TARGET_DIR"/
+            rm -rf /tmp/temp_download
+            
+            STATUS_MSG="🆕 发现更新：$UPDATED_PKGS"
+            COMMIT_MSG="$SHORT_DATE 更新: $UPDATED_PKGS"
+            echo "is_failed=false" >> $GITHUB_OUTPUT
+            
+          # 3. 正常无更新的逻辑
+          else
+            STATUS_MSG="✅ 上游无更新，保持稳定。"
+            COMMIT_MSG="$SHORT_DATE 无更新"
+            echo "is_failed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          
+          # 生成 README 结构
+          echo "# 专属软件源" > README.md
+          echo "## 🎯 路由器软件源配置" >> README.md
+          echo "\`\`\`text" >> README.md
+          echo "src/gz custom_a53 https://raw.githubusercontent.com/${{ github.repository }}/main/$TARGET_DIR" >> README.md
+          echo "\`\`\`" >> README.md
+          echo "" >> README.md
+          echo "## 📅 状态与最新更新日志" >> README.md
+          echo "* **今日同步状态**: \`$SHORT_DATE $STATUS_MSG\`" >> README.md
+          echo "" >> README.md
+          echo "---" >> README.md
+          echo "*依赖备份*" >> README.md
+
+      - name: Commit and push with clean history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add -A
+          
+          if ! git diff --cached --quiet; then
+            git checkout --orphan temp_branch
+            git commit -m "Sync: ${{ steps.update_readme.outputs.commit_msg }}"
+            git branch -M temp_branch main
+            git push -f origin main
+            
+            curl -L \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ github.repository }}/git/blobs
+          fi
+          
+          # 若前置校验失败，在发布完错误公告后，彻底掐断流程并报错报警
+          if [ "${{ steps.update_readme.outputs.is_failed }}" == "true" ]; then
+            echo "❌ 由于下载或对账验证失败，流程终止。"
+            exit 1
+          fi
